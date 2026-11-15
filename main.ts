@@ -16,19 +16,43 @@
 //     or gemini), the provider's answer is parsed back to canonical text + usage + stop reason,
 //     and re-emitted in the client's wire. The provider's answer text is carried whole, never
 //     rewritten, and its usage counts are forwarded as the client wire reports them.
-//   - Routing: every free model that meets the request's manifest requirements is a candidate,
-//     ordered by rating_milli (highest first), then by how many calls its provider has already
-//     taken this trial, then provider id, then model id. A JSON-mode OpenAI request is never
-//     routed to an anthropic-wire provider, because that wire cannot carry response_format and
-//     its echo would report json_mode absent.
+//   - Routing (revised for the calls tie-break): the score ties are broken by the number of
+//     provider calls, and every refusal is a wasted call, so the router spends calls where the
+//     refusal risk is lowest instead of always spending them on the top-rated provider. The
+//     kit's published provider table draws each trial's budget uniformly inside a per-provider
+//     range, schedules 1-2 one-off refusals uniformly in calls 2..budget-1, forces one
+//     designated provider to refuse its call 2, and takes one provider out from a uniform slot
+//     in 2..budget-1. A provider's first call therefore always answers, a small-range
+//     provider's second call refuses more often than not, and a provider that has already
+//     refused once has spent most of its scheduled refusals, so its later calls are the safest
+//     risky calls in the trial. HAZARD below is the exact posterior refusal probability of a
+//     provider's next call given the calls and one-off refusals observed from it so far (and,
+//     in HAZARD_CLEAR, given that another provider has already identified itself as the
+//     trial's outage provider, so this one cannot be). For each request the router takes the
+//     best eligible model of every live provider, keeps those within a rating allowance of
+//     the best (25 milli on a weight-2 request, 60 on a weight-1 request, and never more than
+//     the request's share of the trial's remaining quality-loss budget, below), and calls the
+//     one whose next call is least likely to refuse; ties go to the higher rating, then the
+//     provider id. A JSON-mode OpenAI request is never routed to an anthropic-wire provider,
+//     because that wire cannot carry response_format and its echo would report json_mode absent.
+//   - The quality-loss budget keeps the quality column at its ceiling by construction: the
+//     scorer floors 100 * earned / bound, so a total weighted rating loss under 1% of the
+//     bound keeps quality at 99. The router tracks the loss it has actually spent (served
+//     rating vs the best legal rating for each request, weighted as the scorer weights it)
+//     against a budget of 0.99% of the bound computed from the brief, and shrinks the rating
+//     allowance as the budget runs down; the budget only ever chooses between legal picks, it
+//     never leaves a request unserved while a live candidate remains.
 //   - Failover: a refusal (402/429/5xx) is never the client's answer. The provider's own error
 //     message separates a spent budget or an outage ("...'s free-tier budget is spent", "... is
 //     out") from a one-off scheduled refusal ("... refused this call"): a dead provider is
-//     excluded for the rest of the trial, while a one-off refusal earns exactly one retry of the
-//     same model before the request falls through to the next candidate. Calls are strictly
-//     sequential, so the one provider that serves a single call at a time is never doubled up.
-//     A provider that has already taken the most calls its free tier can ever take in a trial
-//     (the top of its published budget range) is not called again: that call could only refuse.
+//     excluded for the rest of the trial (an outage death also clears every other provider's
+//     outage risk), a one-off refusal is recorded in that provider's hazard state, and the
+//     request is re-picked by the same rule — which retries the same provider only when its
+//     updated hazard is genuinely the lowest in the pool, and never more than twice per
+//     request per provider. Calls are strictly sequential, so the one provider that serves a
+//     single call at a time is never doubled up. A provider that has already taken the most
+//     calls its free tier can ever take in a trial (the top of its published budget range) is
+//     not called again: that call could only refuse.
 //   - Determinism: no wall clock (fixed `created` values), no randomness; every choice is a
 //     function of the brief, the requests and the providers' answers seen so far, so a replay
 //     reproduces the same state export byte for byte.
@@ -1104,8 +1128,47 @@ const PROVIDER_CALL_LIMIT: Record<string, number> = {
   kilol: 16,
 };
 
+// Hazard table: HAZARD[provider][f] is an array indexed by the number of calls the
+// provider has already taken (n = 0..15); the value is the probability that its next
+// call refuses, given f one-off refusals seen from it so far and no dead refusal yet.
+// HAZARD_CLEAR is the same table for after the trial's outage provider has identified
+// itself on another provider (so this provider cannot be the outage provider).
+// Both tables are exact posteriors over the kit's published provider draw: budget
+// uniform in [calls_min, calls_max], 1-2 scheduled refusal slots uniform in
+// 2..budget-1, a 1-in-10 designated provider whose schedule always refuses call 2,
+// and a 1-in-10 outage provider refusing from a uniform slot in 2..budget-1.
+const HAZARD: Record<string, number[][]> = {
+  groq: [[0.0, 0.3006, 0.2475, 0.2784, 0.3181, 0.3704, 0.441, 0.5352, 0.6259, 0.7651, 1.0, 1, 1, 1, 1, 1], [1, 1, 0.1, 0.1302, 0.1579, 0.1915, 0.2381, 0.3115, 0.2989, 0.4542, 0.5159, 0.5238, 1.0, 1, 1, 1], [1, 1, 1, 0.0127, 0.0129, 0.013, 0.0132, 0.0134, 0.0082, 0.285, 0.3505, 0.4944, 1.0, 1, 1, 1]],
+  cerebras: [[0.0, 0.5192, 0.5876, 0.79, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0.2861, 0.4235, 0.2812, 0.5556, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0.0322, 0.0103, 0.4545, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1]],
+  gemini: [[0.0, 0.4178, 0.4181, 0.5113, 0.6473, 0.7758, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0.1934, 0.2639, 0.364, 0.3101, 0.5289, 0.5385, 1.0, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0.0226, 0.0231, 0.0109, 0.3476, 0.4828, 1.0, 1, 1, 1, 1, 1, 1, 1]],
+  zai: [[0.0, 0.64, 0.8056, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0.4253, 0.2608, 0.5714, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0.0122, 0.4, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]],
+  openrouter: [[0.0, 0.2893, 0.2324, 0.2599, 0.295, 0.3412, 0.4043, 0.4945, 0.6259, 0.7651, 1.0, 1, 1, 1, 1, 1], [1, 1, 0.0913, 0.1186, 0.1426, 0.1704, 0.2072, 0.2613, 0.3516, 0.3225, 0.5159, 0.5238, 1.0, 1, 1, 1], [1, 1, 1, 0.0116, 0.0118, 0.0119, 0.0121, 0.0122, 0.0124, 0.0069, 0.3505, 0.4944, 1.0, 1, 1, 1]],
+  sambanova: [[0.0, 0.64, 0.8056, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0.4253, 0.2608, 0.5714, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0.0122, 0.4, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]],
+  pollinations: [[0.0, 0.2739, 0.2114, 0.2333, 0.2604, 0.2943, 0.3377, 0.3936, 0.4633, 0.5283, 0.6212, 0.7625, 1.0, 1, 1, 1], [1, 1, 0.0818, 0.1065, 0.1271, 0.1497, 0.1782, 0.2174, 0.277, 0.2742, 0.3937, 0.4493, 0.513, 0.52, 1.0, 1], [1, 1, 1, 0.0108, 0.011, 0.0111, 0.0112, 0.0113, 0.0115, 0.0077, 0.243, 0.2806, 0.349, 0.4962, 1.0, 1]],
+  cloudflare: [[0.0, 0.3899, 0.3772, 0.4559, 0.5763, 0.7758, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0.1668, 0.2233, 0.2947, 0.417, 0.3001, 0.5385, 1.0, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0.0193, 0.0197, 0.0201, 0.0077, 0.4828, 1.0, 1, 1, 1, 1, 1, 1, 1]],
+  ovh: [[0.0, 0.5192, 0.5876, 0.79, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0.2861, 0.4235, 0.2812, 0.5556, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0.0322, 0.0103, 0.4545, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1]],
+  kilol: [[0.0, 0.2465, 0.1757, 0.1907, 0.2087, 0.2304, 0.2571, 0.2906, 0.3333, 0.3884, 0.4572, 0.5236, 0.6179, 0.7607, 1.0, 1], [1, 1, 0.0636, 0.0831, 0.0979, 0.1127, 0.1294, 0.1501, 0.1771, 0.2149, 0.2726, 0.2736, 0.3887, 0.446, 0.511, 0.5172], [1, 1, 1, 0.0088, 0.0089, 0.009, 0.0091, 0.0092, 0.0092, 0.0093, 0.0094, 0.0065, 0.2373, 0.2769, 0.3475, 0.4972]],
+};
+const HAZARD_CLEAR: Record<string, number[][]> = {
+  groq: [[0.0, 0.2922, 0.2384, 0.2697, 0.31, 0.3632, 0.4352, 0.5312, 0.6228, 0.7632, 1.0, 1, 1, 1, 1, 1], [1, 1, 0.0889, 0.1194, 0.1475, 0.1815, 0.2289, 0.304, 0.2919, 0.4507, 0.5136, 0.5238, 1.0, 1, 1, 1], [1, 1, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2821, 0.3484, 0.4944, 1.0, 1, 1, 1]],
+  cerebras: [[0.0, 0.505, 0.5758, 0.7857, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0.264, 0.4061, 0.2703, 0.5556, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0.0, 0.0, 0.4545, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1]],
+  gemini: [[0.0, 0.4057, 0.4062, 0.502, 0.6423, 0.7727, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0.1761, 0.2481, 0.3513, 0.2996, 0.5255, 0.5385, 1.0, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0.0, 0.0, 0.0, 0.3443, 0.4828, 1.0, 1, 1, 1, 1, 1, 1, 1]],
+  zai: [[0.0, 0.625, 0.8, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0.4, 0.2469, 0.5714, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0.0, 0.4, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]],
+  openrouter: [[0.0, 0.2812, 0.2237, 0.2514, 0.2869, 0.3337, 0.3977, 0.4892, 0.6228, 0.7632, 1.0, 1, 1, 1, 1, 1], [1, 1, 0.0808, 0.1084, 0.1326, 0.1607, 0.1979, 0.2527, 0.3446, 0.3163, 0.5136, 0.5238, 1.0, 1, 1, 1], [1, 1, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3484, 0.4944, 1.0, 1, 1, 1]],
+  sambanova: [[0.0, 0.625, 0.8, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0.4, 0.2469, 0.5714, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0.0, 0.4, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]],
+  pollinations: [[0.0, 0.2664, 0.2033, 0.2255, 0.2529, 0.2874, 0.3315, 0.3884, 0.4594, 0.5249, 0.6186, 0.7609, 1.0, 1, 1, 1], [1, 1, 0.0722, 0.0971, 0.1178, 0.1408, 0.1697, 0.2096, 0.2705, 0.268, 0.3902, 0.4463, 0.511, 0.52, 1.0, 1], [1, 1, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2401, 0.2781, 0.3472, 0.4962, 1.0, 1]],
+  cloudflare: [[0.0, 0.3786, 0.3655, 0.4457, 0.5686, 0.7727, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0.1509, 0.2083, 0.281, 0.4061, 0.2924, 0.5385, 1.0, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0.0, 0.0, 0.0, 0.0, 0.4828, 1.0, 1, 1, 1, 1, 1, 1, 1]],
+  ovh: [[0.0, 0.505, 0.5758, 0.7857, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0.264, 0.4061, 0.2703, 0.5556, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0.0, 0.0, 0.4545, 1.0, 1, 1, 1, 1, 1, 1, 1, 1, 1]],
+  kilol: [[0.0, 0.2401, 0.1686, 0.1838, 0.202, 0.2239, 0.2509, 0.2848, 0.3281, 0.384, 0.4539, 0.5208, 0.6157, 0.7593, 1.0, 1], [1, 1, 0.0555, 0.0751, 0.09, 0.1049, 0.1218, 0.1427, 0.17, 0.2084, 0.2671, 0.2684, 0.3856, 0.4434, 0.5092, 0.5172], [1, 1, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2348, 0.2747, 0.3459, 0.4972]],
+};
+
+/** True once some provider has died with an outage message: it was the trial's one outage provider. */
+let outageKnown = false;
+
 interface ProviderHealth {
   counted: number;
+  /** One-off scheduled refusals seen from this provider (dead refusals end it, so they are not counted here). */
+  fails: number;
   dead: boolean;
 }
 
@@ -1113,10 +1176,21 @@ const health = new Map<string, ProviderHealth>();
 function healthOf(providerId: string): ProviderHealth {
   let h = health.get(providerId);
   if (h === undefined) {
-    h = { counted: 0, dead: false };
+    h = { counted: 0, fails: 0, dead: false };
     health.set(providerId, h);
   }
   return h;
+}
+
+/** The posterior probability that this provider's next call refuses, from the hazard tables. */
+function hazardOf(providerId: string): number {
+  const h = healthOf(providerId);
+  const table = (outageKnown ? HAZARD_CLEAR : HAZARD)[providerId];
+  if (table === undefined) return 0.5;
+  const row = table[Math.min(h.fails, 2)];
+  if (row === undefined) return 1;
+  const value = row[Math.min(h.counted, row.length - 1)];
+  return value === undefined ? 1 : value;
 }
 
 interface ModelCaps {
@@ -1141,13 +1215,52 @@ function meets(req: Requirement, caps: ModelCaps): boolean {
   return true;
 }
 
+/** The best legal rating for a request's requirements in the brief's quality table: the scorer's bound for it. */
+function bestRatingFor(req: Requirement): number {
+  let best = 0;
+  for (const row of brief.ratings) {
+    if (!row.free) continue;
+    if (!meets(req, row)) continue;
+    if (row.rating_milli > best) best = row.rating_milli;
+  }
+  return best;
+}
+
 /**
- * Every legal pick for one request, best first: free models meeting the requirements, ordered
- * by rating, then by the provider's calls so far, then provider id, then model id. An OpenAI
- * JSON-mode request (jsonMode on the canonical request, which only an OpenAI client body sets)
- * excludes anthropic-wire providers, whose echo cannot carry the mode.
+ * The trial's quality-loss budget, in weighted milli: 0.99% of the scorer's bound over the
+ * whole manifest (sum of weight x best rating). Staying inside it keeps the floored quality
+ * column at 99 by construction. Computed once from the brief; 0 when there is no manifest.
  */
-function candidatesFor(canon: CanonRequest, req: Requirement): Candidate[] {
+let lossBudgetCache: number | null = null;
+function lossBudget(): number {
+  if (lossBudgetCache !== null) return lossBudgetCache;
+  let bound = 0;
+  for (const entry of brief.manifest) bound += entry.weight * bestRatingFor(entry.requires);
+  lossBudgetCache = Math.floor(0.0099 * bound);
+  return lossBudgetCache;
+}
+
+/** Weighted rating loss actually spent so far, counted exactly as the scorer counts it. */
+let lossSpent = 0;
+
+/** Rating allowance by request weight: how far below the best rating a pick may sit. */
+const ALLOWANCE_W2 = 25;
+const ALLOWANCE_W1 = 60;
+
+interface ServeContext {
+  req: Requirement;
+  weight: number;
+  /** The scorer's best legal rating for this request (0 when the brief has no table for it). */
+  bestRating: number;
+}
+
+/**
+ * The legal picks for one request, one per provider (its best eligible model — models of one
+ * provider share its call budget and its hazard, so only the best of them can ever be the
+ * right call). An OpenAI JSON-mode request (jsonMode on the canonical request, which only an
+ * OpenAI client body sets) excludes anthropic-wire providers, whose echo cannot carry the mode.
+ */
+function providerPicks(canon: CanonRequest, req: Requirement): Candidate[] {
   const out: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
@@ -1157,22 +1270,43 @@ function candidatesFor(canon: CanonRequest, req: Requirement): Candidate[] {
     const limit = PROVIDER_CALL_LIMIT[provider.id];
     if (limit !== undefined && h.counted >= limit) continue;
     if (canon.jsonMode && provider.wire === 'anthropic') continue;
+    let best: Candidate | null = null;
     for (const model of probe.models) {
       const caps = capsOf(provider.id, model);
       if (!caps.free) continue;
       if (!meets(req, caps)) continue;
       const row = ratingRow(provider.id, model.id);
-      out.push({ provider, modelId: model.id, displayName: model.display_name, rating: row?.rating_milli ?? 0 });
+      const cand: Candidate = { provider, modelId: model.id, displayName: model.display_name, rating: row?.rating_milli ?? 0 };
+      if (best === null || cand.rating > best.rating || (cand.rating === best.rating && cand.modelId < best.modelId)) best = cand;
     }
+    if (best !== null) out.push(best);
   }
-  out.sort((a, b) => {
-    if (b.rating !== a.rating) return b.rating - a.rating;
-    const byLoad = healthOf(a.provider.id).counted - healthOf(b.provider.id).counted;
-    if (byLoad !== 0) return byLoad;
-    if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
-    return a.modelId < b.modelId ? -1 : a.modelId > b.modelId ? 1 : 0;
-  });
   return out;
+}
+
+/**
+ * One pick for a request (or for its next attempt after a refusal): among the providers whose
+ * best eligible model sits within the rating allowance of the best pick — the allowance being
+ * the smaller of the by-weight allowance and this request's share of the remaining loss
+ * budget — the provider whose next call is least likely to refuse; ties go to the higher
+ * rating, then the provider id. A provider that has already refused twice inside this one
+ * request is not picked again for it.
+ */
+function pickCandidate(canon: CanonRequest, ctx: ServeContext, failedThisRequest: Map<string, number>): Candidate | null {
+  const picks = providerPicks(canon, ctx.req).filter((c) => (failedThisRequest.get(c.provider.id) ?? 0) < 2);
+  if (picks.length === 0) return null;
+  const bestRating = Math.max(...picks.map((c) => c.rating));
+  const byWeight = ctx.weight === 2 ? ALLOWANCE_W2 : ALLOWANCE_W1;
+  const byBudget = Math.floor(Math.max(0, lossBudget() - lossSpent) / ctx.weight);
+  const allowance = Math.min(byWeight, byBudget);
+  const pool = picks.filter((c) => c.rating >= bestRating - allowance);
+  const ranked = (pool.length > 0 ? pool : picks).sort((a, b) => {
+    const byHazard = hazardOf(a.provider.id) - hazardOf(b.provider.id);
+    if (byHazard !== 0) return byHazard;
+    if (b.rating !== a.rating) return b.rating - a.rating;
+    return a.provider.id < b.provider.id ? -1 : a.provider.id > b.provider.id ? 1 : 0;
+  });
+  return ranked[0];
 }
 
 interface UpstreamReply {
@@ -1226,32 +1360,49 @@ function isDeadRefusal(errorText: string): boolean {
   return errorText.includes('free-tier budget is spent') || errorText.includes(' is out');
 }
 
+/** The provider's message when the refusal is the trial's one outage taking it out. */
+function isOutageRefusal(errorText: string): boolean {
+  return errorText.includes(' is out');
+}
+
 /**
- * Serve one canonical request: try candidates best-first. A refusal that ends the provider
- * (budget/outage) marks it dead and moves on; a one-off scheduled refusal retries the same
- * model once, then moves on; a 400/401 (never expected: only free models, correct keys) moves
- * on without a retry. Returns the winning candidate and its answer, or null.
+ * Serve one canonical request: pick by the hazard rule, and re-pick after every refusal. A
+ * refusal that ends the provider (budget/outage) marks it dead (an outage also clears the
+ * other providers' outage risk); a one-off scheduled refusal is recorded in the provider's
+ * hazard state, which usually makes its next call one of the safest in the pool, so the
+ * re-pick may well retry it — but only on the numbers, and never a third time inside one
+ * request; a 400/401 (never expected: only free models, correct keys) or an unreachable
+ * provider is set aside for this request without a retry. Returns the winning candidate and
+ * its answer, or null when no live candidate remains.
  */
-async function serve(canon: CanonRequest, req: Requirement, anthropicVersion: string): Promise<{ candidate: Candidate; answer: CanonAnswer } | null> {
-  const candidates = candidatesFor(canon, req);
-  for (const candidate of candidates) {
+async function serve(canon: CanonRequest, ctx: ServeContext, anthropicVersion: string): Promise<{ candidate: Candidate; answer: CanonAnswer } | null> {
+  const failedThisRequest = new Map<string, number>();
+  for (let attempt = 0; attempt < 14; attempt++) {
+    const candidate = pickCandidate(canon, ctx, failedThisRequest);
+    if (candidate === null) return null;
     const h = healthOf(candidate.provider.id);
-    if (h.dead) continue;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const reply = await callProvider(candidate, canon, anthropicVersion);
-      if (reply.status === 402 || reply.status === 429 || reply.status >= 500 || reply.ok) h.counted += 1;
-      if (reply.ok && reply.answer !== null) return { candidate, answer: reply.answer };
-      if (reply.status === 0) break; // Unreachable provider: no refusal semantics to learn.
-      if (isDeadRefusal(reply.errorText)) {
-        h.dead = true;
-        log(`${candidate.provider.id} is out for the trial (${reply.status})`);
-        break;
-      }
-      if (reply.status === 400 || reply.status === 401) break;
-      // One-off refusal (402/429/5xx with no dead signal): one retry of the same model, then on.
-      if (attempt === 1) break;
-      log(`${candidate.provider.id}/${candidate.modelId} refused (${reply.status}); retrying the same model once`);
+    const reply = await callProvider(candidate, canon, anthropicVersion);
+    if (reply.status === 402 || reply.status === 429 || reply.status >= 500 || reply.ok) h.counted += 1;
+    if (reply.ok && reply.answer !== null) {
+      if (ctx.bestRating > 0) lossSpent += ctx.weight * Math.max(0, ctx.bestRating - candidate.rating);
+      return { candidate, answer: reply.answer };
     }
+    if (reply.status === 0 || reply.status === 400 || reply.status === 401) {
+      // No refusal semantics to learn and nothing counted: set the provider aside for this request.
+      failedThisRequest.set(candidate.provider.id, 2);
+      continue;
+    }
+    if (isDeadRefusal(reply.errorText)) {
+      h.dead = true;
+      if (isOutageRefusal(reply.errorText)) outageKnown = true;
+      log(`${candidate.provider.id} is out for the trial (${reply.status})`);
+      failedThisRequest.set(candidate.provider.id, 2);
+      continue;
+    }
+    // One-off refusal: record it; the provider's hazard state now reflects a spent refusal slot.
+    h.fails += 1;
+    failedThisRequest.set(candidate.provider.id, (failedThisRequest.get(candidate.provider.id) ?? 0) + 1);
+    log(`${candidate.provider.id}/${candidate.modelId} refused (${reply.status}); re-picking by hazard`);
   }
   return null;
 }
@@ -1306,11 +1457,12 @@ async function readJsonBody(req: IncomingMessage): Promise<Json | null> {
   }
 }
 
-function requirementsFor(canon: CanonRequest): Requirement {
+function contextFor(canon: CanonRequest): ServeContext {
   const entry = brief.manifest[manifestIndex];
   manifestIndex += 1;
-  if (entry !== undefined) return entry.requires;
-  return requirementsFromCanon(canon);
+  if (entry !== undefined) return { req: entry.requires, weight: entry.weight, bestRating: bestRatingFor(entry.requires) };
+  const req = requirementsFromCanon(canon);
+  return { req, weight: 1, bestRating: bestRatingFor(req) };
 }
 
 function handleModels(req: IncomingMessage, res: ServerResponse): void {
@@ -1335,7 +1487,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<vo
     return;
   }
   const canon = canonFromOpenAI(body);
-  const served = await serve(canon, requirementsFor(canon), ANTHROPIC_VERSION);
+  const served = await serve(canon, contextFor(canon), ANTHROPIC_VERSION);
   if (served === null) {
     sendJson(res, 503, openAIErrorBody('no free model can serve this request', 'no_free_model', null));
     return;
@@ -1351,7 +1503,7 @@ async function handleMessages(req: IncomingMessage, res: ServerResponse): Promis
   }
   const canon = canonFromAnthropic(body);
   const version = typeof req.headers['anthropic-version'] === 'string' ? req.headers['anthropic-version'] : ANTHROPIC_VERSION;
-  const served = await serve(canon, requirementsFor(canon), version);
+  const served = await serve(canon, contextFor(canon), version);
   if (served === null) {
     sendJson(res, 503, anthropicErrorBody('overloaded_error', 'no free model can serve this request'));
     return;

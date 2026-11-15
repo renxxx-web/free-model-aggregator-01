@@ -25,11 +25,18 @@ only.
   `max_tokens`, stops, images, JSON mode — and is re-encoded in the chosen
   provider's wire; the answer is parsed back and re-emitted in the client's
   wire with the provider's text whole and its usage counts mapped across.
-- Candidates are the free models that meet the request's requirements, ordered
-  by rating. A refusal is never the answer: a spent budget or an outage (the
-  provider's own message says which) retires that provider for the trial, a
-  one-off refusal retries the same model once, and then the request falls
-  through to the next candidate. A provider that has taken the most calls its
-  free tier can ever take in a trial is not called again.
+- Candidates are the free models that meet the request's requirements. Because
+  the score's tie-break counts provider calls, the router spends them where a
+  refusal is least likely: each provider's next-call refusal probability is
+  tracked as an exact posterior over the kit's published budget/refusal draw
+  (a first call always answers; a provider that has refused once has spent
+  most of its scheduled refusals, so its later calls are the safest risky
+  calls), and each request is routed to the lowest-risk provider whose rating
+  sits within a small allowance of the best — under a trial-wide quality-loss
+  budget (0.99% of the scorer's bound) that keeps the quality column at its
+  ceiling. A refusal is never the answer: a spent budget or an outage (the
+  provider's own message says which) retires that provider for the trial, and
+  the request is re-picked by the same rule. A provider that has taken the
+  most calls its free tier can ever take in a trial is not called again.
 - No wall clock, no randomness: every choice follows from the brief, the
   requests and the providers' answers, so a replay leaves the same state.
